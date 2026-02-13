@@ -1004,7 +1004,11 @@ class ElfTable(object):
 		assert idx >= 0 and idx < count
 
 		data = ida_bytes.get_bytes(self.ea + idx * self.entry_size, self.entry_size)
-		assert len(data) == self.entry_size
+		data_len = len(data) if data is not None else 0
+		if data_len != self.entry_size:
+			raise RuntimeError('Insufficient data for %s entry #%d: 0x%x (expected: 0x%x)' % (
+				self.type_name(), idx, data_len, self.entry_size
+			))
 
 		entry = parse_struct(self.struct_name(), data)
 
@@ -2144,8 +2148,9 @@ class ps5_elf_plugin_t(ida_idaapi.plugin_t):
 		dyns = []
 		while ea < end_ea:
 			data = ida_bytes.get_bytes(ea, struct_size)
-			if len(data) != struct_size:
-				raise RuntimeError('Insufficient data of %s structure: 0x%x (expected: 0x%x)' % (struct_name, len(data), struct_size))
+			data_len = len(data) if data is not None else 0
+			if data_len != struct_size:
+				raise RuntimeError('Insufficient data of %s structure: 0x%x (expected: 0x%x)' % (struct_name, data_len, struct_size))
 
 			dyn = parse_struct(struct_name, data)
 			if dyn['d_tag'] == ElfUtil.DT_NULL:
@@ -2227,7 +2232,15 @@ class ps5_elf_plugin_t(ida_idaapi.plugin_t):
 			elif tag == ElfUtil.DT_RELAENT: # ELF RELA Relocation Table
 				size = as_uint64(value)
 				if size != ida_idaapi.BADADDR:
-					assert size == get_struct_size(self.rela_reloc_table.struct_name())
+					try:
+						exp = get_struct_size(self.rela_reloc_table.struct_name())
+						if exp and size != exp:
+							ida_kernwin.warning('DT_RELAENT=0x%x does not match %s size=0x%x, using 0x%x.' % (
+								size, self.rela_reloc_table.struct_name(), exp, exp
+							))
+							size = exp
+					except Exception as e:
+						ida_kernwin.warning('Unable to validate DT_RELAENT: %s' % e)
 					self.rela_reloc_table.entry_size = size
 			elif tag == ElfUtil.DT_RELACOUNT: # ELF RELA Relocation Table
 				count = as_uint64(value)
@@ -2262,7 +2275,15 @@ class ps5_elf_plugin_t(ida_idaapi.plugin_t):
 			elif tag == ElfUtil.DT_SYMENT: # ELF Symbol Table
 				size = as_uint64(value)
 				if size != ida_idaapi.BADADDR:
-					assert size == get_struct_size(self.symbol_table.struct_name())
+					try:
+						exp = get_struct_size(self.symbol_table.struct_name())
+						if exp and size != exp:
+							ida_kernwin.warning('DT_SYMENT=0x%x does not match %s size=0x%x, using 0x%x.' % (
+								size, self.symbol_table.struct_name(), exp, exp
+							))
+							size = exp
+					except Exception as e:
+						ida_kernwin.warning('Unable to validate DT_SYMENT: %s' % e)
 					self.symbol_table.entry_size = size
 			elif tag == ElfUtil.DT_STRTAB: # ELF String Table
 				ea = as_uint64(value)
@@ -2580,7 +2601,7 @@ class ps5_elf_plugin_t(ida_idaapi.plugin_t):
 			# Try to decode value as UTF-8 string.
 			try:
 				value = value.decode('utf-8').rstrip('\0')
-			except:
+			except Exception:
 				pass
 
 			self.prodg_meta_data[key] = value
@@ -3641,8 +3662,9 @@ class ps5_elf_plugin_t(ida_idaapi.plugin_t):
 					ida_segment.set_segm_end(seg.start_ea, end_ea_al, ida_segment.SEGMOD_KEEP | ida_segment.SEGMOD_SILENT)
 
 		data = ida_bytes.get_bytes(seg.start_ea, size)
-		if len(data) != size:
-			raise RuntimeError('Insufficient data of %s structure: 0x%x (expected: 0x%x)' % (struct_name, len(data), size))
+		data_len = len(data) if data is not None else 0
+		if data_len != size:
+			raise RuntimeError('Insufficient data of %s structure: 0x%x (expected: 0x%x)' % (struct_name, data_len, size))
 
 		return handler_cb(segment_name, struct_name, data[prefix_len:])
 
@@ -4112,18 +4134,13 @@ class ps5_elf_plugin_t(ida_idaapi.plugin_t):
 				ida_segment.set_segm_name(seg, '.data')
 
 			seg = ida_segment.get_next_seg(seg.start_ea)
-			if seg == last_seg:
-				break
 
 		print('Merging similar neighboring segments.')
 
 		seg1 = first_seg
 		while seg1:
 			name1 = ida_segment.get_segm_name(seg1)
-			sclass1 = ida_segment.get_segm_class(seg1)
 			idx1 = ida_segment.get_segm_num(seg1.start_ea)
-
-			#print('Processing segment #%03d: %s' % (idx1, name1))
 
 			finished = False
 			while not finished:
@@ -4134,13 +4151,9 @@ class ps5_elf_plugin_t(ida_idaapi.plugin_t):
 				is_last = seg2 == last_seg
 
 				name2 = ida_segment.get_segm_name(seg2)
-				sclass2 = ida_segment.get_segm_class(seg2)
 				idx2 = ida_segment.get_segm_num(seg2.start_ea)
 
-				#print('Comparing with segment #%03d: %s' % (idx2, name2))
-
 				if name1 != name2 or seg1.perm != seg2.perm or seg1.end_ea != seg2.start_ea:
-					#print('Merging done: params mismatch')
 					finished = True
 					break
 
@@ -4154,12 +4167,11 @@ class ps5_elf_plugin_t(ida_idaapi.plugin_t):
 				ida_segment.update_segm(seg1)
 
 				if is_last:
-					#print('Merging done: was last segment')
 					break
 
-			seg1 = ida_segment.get_next_seg(seg1.start_ea)
 			if seg1 == last_seg:
 				break
+			seg1 = ida_segment.get_next_seg(seg1.start_ea)
 
 		return True
 
@@ -4857,19 +4869,23 @@ class ps5_elf_plugin_t(ida_idaapi.plugin_t):
 				existing = ida_segment.getseg(bss_start_ea)
 				if existing and existing.start_ea == bss_start_ea and existing.end_ea == bss_end_ea and (existing.perm & ida_segment.SEGPERM_WRITE):
 					print('Marking existing segment as .bss.')
-					try:
-						ida_segment.set_segm_name(existing, '.bss')
-					except Exception:
-						ida_segment.set_segm_name(existing, '.bss')
+					ida_segment.set_segm_name(existing, '.bss')
 					existing.type = ida_segment.SEG_BSS
 					existing.perm = ida_segment.SEGPERM_READ | ida_segment.SEGPERM_WRITE
 					ida_segment.update_segm(existing)
 					return True
 
 				# Shrink any writable segments that overlap the BSS tail, to avoid overlaps.
+				seg_starts = []
 				for i in range(ida_segment.get_segm_qty()):
 					s = ida_segment.getnseg(i)
-					if not s or (s.perm & ida_segment.SEGPERM_WRITE) == 0:
+					if s:
+						seg_starts.append(s.start_ea)
+				for sea in seg_starts:
+					s = ida_segment.getseg(sea)
+					if not s or s.start_ea != sea:
+						continue
+					if (s.perm & ida_segment.SEGPERM_WRITE) == 0:
 						continue
 					if s.start_ea < bss_start_ea < s.end_ea:
 						try:
@@ -5054,11 +5070,11 @@ class ps5_elf_plugin_t(ida_idaapi.plugin_t):
 	def _fixup_plt_segment(self):
 		print('Fixing up .plt segment.')
 
-		if not self.jmprel_reloc_table.is_table_loaded():
+		if not self.jmprel_reloc_table or not self.jmprel_reloc_table.is_table_loaded():
 			ida_kernwin.warning('Jmprel relocation table is not loaded, cannot fixup .plt segment.')
 			return False
 
-		if not self.string_table.is_loaded():
+		if not self.string_table or not self.string_table.is_loaded():
 			ida_kernwin.warning('String table is not loaded, cannot fixup .plt segment.')
 			return False
 
@@ -5283,11 +5299,11 @@ class ps5_elf_plugin_t(ida_idaapi.plugin_t):
 	def _fixup_relocations(self):
 		print('Fixing up relocations.')
 
-		if not self.rela_reloc_table.is_table_loaded():
+		if not self.rela_reloc_table or not self.rela_reloc_table.is_table_loaded():
 			ida_kernwin.warning('Rela relocation table is not loaded, cannot fixup relocations.')
 			return False
 
-		if not self.string_table.is_loaded():
+		if not self.string_table or not self.string_table.is_loaded():
 			ida_kernwin.warning('String table is not loaded, cannot fixup relocations.')
 			return False
 
@@ -5325,6 +5341,18 @@ class ps5_elf_plugin_t(ida_idaapi.plugin_t):
 					return False
 			except Exception:
 				return False
+			if hasattr(gcc_extab, 'safe_add_dref'):
+				try:
+					return bool(gcc_extab.safe_add_dref(slot_ea, dst_ea, create_from=True, create_to=False))
+				except Exception:
+					return False
+			try:
+				if not ida_bytes.is_head(ida_bytes.get_full_flags(slot_ea)):
+					return False
+				ida_xref.add_dref(slot_ea, dst_ea, ida_xref.dr_O | ida_xref.XREF_USER)
+				return True
+			except Exception:
+				return False
 
 		def symbol_name_safe(symbol, symbol_idx):
 			try:
@@ -5344,18 +5372,6 @@ class ps5_elf_plugin_t(ida_idaapi.plugin_t):
 			except Exception:
 				raw = 0
 			return self._resolve_tls_value(raw)[:2]
-			if hasattr(gcc_extab, 'safe_add_dref'):
-				try:
-					return bool(gcc_extab.safe_add_dref(slot_ea, dst_ea, create_from=True, create_to=False))
-				except Exception:
-					return False
-			try:
-				if not ida_bytes.is_head(ida_bytes.get_full_flags(slot_ea)):
-					return False
-				ida_xref.add_dref(slot_ea, dst_ea, ida_xref.dr_O | ida_xref.XREF_USER)
-				return True
-			except Exception:
-				return False
 
 		for i in range(rela_entry_count):
 			if (i & 0x3FF) == 0:
@@ -5692,18 +5708,13 @@ class ps5_elf_plugin_t(ida_idaapi.plugin_t):
 			ida_auto.reanalyze_callers(ea, True)
 
 	def _find_last_rw_seg(self):
-		rw_seg = None
-
-		seg, first_seg = ida_segment.get_last_seg(), ida_segment.get_first_seg()
-		while seg and seg != first_seg:
-			name = ida_segment.get_segm_name(seg)
-			sclass = ida_segment.get_segm_class(seg)
-			if seg.perm == ida_segment.SEGPERM_READ | ida_segment.SEGPERM_WRITE:
-				rw_seg = seg
-				break
+		want = ida_segment.SEGPERM_READ | ida_segment.SEGPERM_WRITE
+		seg = ida_segment.get_last_seg()
+		while seg:
+			if (seg.perm & want) == want:
+				return seg
 			seg = ida_segment.get_prev_seg(seg.start_ea)
-
-		return rw_seg
+		return None
 
 	def _print_analysis_summary(self):
 		if self.soname is not None:
@@ -5772,7 +5783,7 @@ class ps5_elf_plugin_t(ida_idaapi.plugin_t):
 				except Exception:
 					pass
 				ok = cb()
-				if strict and ok is False:
+				if strict and not ok:
 					print('[%s] Step failed at %d/%d: %s' % (stage_name, idx, total, label))
 					return False
 			return True
@@ -5803,6 +5814,73 @@ class ps5_elf_plugin_t(ida_idaapi.plugin_t):
 		except Exception:
 			try:
 				ida_kernwin.msg('[ps5_elf] Reanalysis after enabling rename_jumpfunc failed:\n')
+				ida_kernwin.msg(traceback.format_exc() + '\n')
+			except Exception:
+				pass
+			return False
+
+	def _final_reanalyze_data_and_eh(self):
+		"""
+		Run an additional focused auto-analysis pass over data/unwind segments after
+		all fixups are complete. This helps IDA discover residual xrefs from data
+		containers (GOT/RELRO/tables) and stabilized unwind metadata.
+		"""
+		try:
+			raw_ranges = []
+			for i in range(ida_segment.get_segm_qty()):
+				seg = ida_segment.getnseg(i)
+				if not seg:
+					continue
+				start_ea = seg.start_ea
+				end_ea = seg.end_ea
+				if start_ea in (ida_idaapi.BADADDR,) or end_ea in (ida_idaapi.BADADDR,) or end_ea <= start_ea:
+					continue
+
+				try:
+					name = (ida_segment.get_segm_name(seg) or '').lower()
+				except Exception:
+					name = ''
+
+				is_eh = ('eh_frame' in name) or ('gcc_except' in name) or ('except_table' in name)
+				is_named_data = (
+					('data' in name) or ('rodata' in name) or ('got' in name) or ('relro' in name)
+					or ('init_array' in name) or ('fini_array' in name) or ('preinit_array' in name)
+				)
+				is_rw_nonexec = ((seg.perm & ida_segment.SEGPERM_EXEC) == 0) and ((seg.perm & ida_segment.SEGPERM_WRITE) != 0)
+				if not (is_eh or is_named_data or is_rw_nonexec):
+					continue
+
+				raw_ranges.append((as_uint64(start_ea), as_uint64(end_ea)))
+
+			if not raw_ranges:
+				return True
+
+			raw_ranges.sort(key=lambda x: (x[0], x[1]))
+			ranges = []
+			for start_ea, end_ea in raw_ranges:
+				if not ranges or start_ea > ranges[-1][1]:
+					ranges.append((start_ea, end_ea))
+				else:
+					ranges[-1] = (ranges[-1][0], max(ranges[-1][1], end_ea))
+
+			print('Running final focused reanalysis for data/.eh_frame ranges: %d.' % len(ranges))
+			all_ok = True
+			for idx, (start_ea, end_ea) in enumerate(ranges, 1):
+				try:
+					if ida_kernwin.user_cancelled():
+						print('Final focused reanalysis canceled by user at range %d/%d.' % (idx, len(ranges)))
+						return False
+				except Exception:
+					pass
+
+				print('  [%d/%d] Reanalyze [0x%x..0x%x).' % (idx, len(ranges), start_ea, end_ea))
+				rc = ida_auto.plan_and_wait(start_ea, end_ea, True)
+				if not rc:
+					all_ok = False
+			return all_ok
+		except Exception:
+			try:
+				ida_kernwin.msg('[ps5_elf] Final focused data/.eh_frame reanalysis failed:\n')
 				ida_kernwin.msg(traceback.format_exc() + '\n')
 			except Exception:
 				pass
@@ -5869,7 +5947,9 @@ class ps5_elf_plugin_t(ida_idaapi.plugin_t):
 		try:
 			# Fallback for IDA sessions where loader_finished wasn't observed by hooks.
 			if not self._pre_analysis_done:
-				self.pre_initial_analysis()
+				if not self.pre_initial_analysis():
+					ida_kernwin.warning('Pre-analysis failed, skipping post-analysis.')
+					return False
 
 			self._ensure_analysis_context()
 			print('Performing post initial auto analysis.')
@@ -5887,8 +5967,9 @@ class ps5_elf_plugin_t(ida_idaapi.plugin_t):
 				('Drop transient .dynsym', self._fixup_dynsym_segment),
 				('Mark known no-return functions', self._mark_noret_funcs),
 				('Enable J_* rename and reanalyze', self._enable_jump_rename_and_reanalyze),
-				# Run LSDA recovery last, after reanalysis has created/stabilized item heads.
+				# Run LSDA recovery after code/global reanalysis has stabilized item heads.
 				('Recover LSDA/.gcc_except_table', self._fixup_lsda_from_eh_frame),
+				('Final focused reanalysis for data/.eh_frame', self._final_reanalyze_data_and_eh),
 			]
 			ok = self._run_with_progress('PS5 ELF post-analysis', steps)
 			if not ok:

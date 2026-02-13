@@ -57,6 +57,7 @@ _warned_missing_bases = set()
 _warned_missing_cie = set()
 _warned_unresolved_indirect = set()
 _entries_in_progress = set()
+MAX_CFI_ENTRY_SIZE = 0x100000
 
 def set_comments_enabled(enabled):
   global _comments_enabled
@@ -694,22 +695,42 @@ def format_lsda(ea, lpstart = None, sjlj = False):
   text_base = _default_text_base()
   data_base = _default_data_base()
   lsda_start_ea = ea
+  lsda_seg = ida_segment.getseg(lsda_start_ea)
+  lsda_limit = lsda_seg.end_ea if lsda_seg else ida_idaapi.BADADDR
   lpstart_enc, ea = format_enc(ea, "LPStart encoding")
   if lpstart_enc != DW_EH_PE_omit:
     lpstart, ea2 = read_enc_val(ea, lpstart_enc, True, text_ea = text_base, data_ea = data_base, funcrel_ea = lpstart)
+    if ea2 in (None, ida_idaapi.BADADDR):
+      print("%08X: failed to decode LSDA LPStart pointer" % ea)
+      return None
     set_cmt(ea, "LPStart: %08X" % lpstart, 0)
     ea = ea2
   ttype_enc, ea = format_enc(ea, "TType encoding")
   ttype_addr = ida_idaapi.BADADDR
   if ttype_enc != DW_EH_PE_omit:
     ttype_off, ea2 = read_enc_val(ea, DW_EH_PE_uleb128, True)
+    if ttype_off in (None, ida_idaapi.BADADDR) or ea2 in (None, ida_idaapi.BADADDR):
+      print("%08X: failed to decode LSDA type table offset" % ea)
+      return None
     ttype_addr = ea2 + ttype_off
+    if lsda_limit not in (None, ida_idaapi.BADADDR) and ttype_addr > lsda_limit:
+      print("%08X: LSDA type table exceeds segment bounds (ttype=%08X, seg_end=%08X)" % (ea, ttype_addr, lsda_limit))
+      return None
     set_cmt(ea, "TType offset: %08X -> %08X" % (ttype_off, ttype_addr), 0)
     make_reloff(ea, ea2)
     ea = ea2
   cs_enc, ea = format_enc(ea, "call site encoding")
   cs_len, ea2 = read_enc_val(ea, DW_EH_PE_uleb128, True)
+  if cs_len in (None, ida_idaapi.BADADDR) or ea2 in (None, ida_idaapi.BADADDR):
+    print("%08X: failed to decode LSDA call site table length" % ea)
+    return None
   action_tbl = ea2 + cs_len
+  if action_tbl < ea2:
+    print("%08X: invalid LSDA call site table length (overflow)" % ea)
+    return None
+  if lsda_limit not in (None, ida_idaapi.BADADDR) and action_tbl > lsda_limit:
+    print("%08X: LSDA call site table exceeds segment bounds (end=%08X, seg_end=%08X)" % (ea, action_tbl, lsda_limit))
+    return None
   set_cmt(ea, "call site table length: %08X\naction table start: %08X" % (cs_len, action_tbl), 0)
   make_reloff(ea, ea2)
   ea = ea2
@@ -719,7 +740,13 @@ def format_lsda(ea, lpstart = None, sjlj = False):
   while ea < action_tbl:
     if sjlj:
       cs_lp, ea2 = read_enc_val(ea, DW_EH_PE_uleb128, True)
+      if ea2 in (None, ida_idaapi.BADADDR):
+        print("%08X: failed to decode SJLJ call-site landing pad" % ea)
+        return None
       cs_action, ea3 = read_enc_val(ea2, DW_EH_PE_uleb128, True)
+      if ea3 in (None, ida_idaapi.BADADDR):
+        print("%08X: failed to decode SJLJ call-site action index" % ea2)
+        return None
       set_cmt(ea, "cs_lp[%d] = %d" % (i, cs_lp), 0)
       act_ea = ea2
       ea = ea3
@@ -732,9 +759,21 @@ def format_lsda(ea, lpstart = None, sjlj = False):
       })
     else:
       cs_start, ea2 = read_enc_val(ea, cs_enc, True, text_ea = text_base, data_ea = data_base, funcrel_ea = lpstart)
+      if ea2 in (None, ida_idaapi.BADADDR):
+        print("%08X: failed to decode call-site start" % ea)
+        return None
       cs_len,   ea3 = read_enc_val(ea2, cs_enc & 0x0F, True)
+      if ea3 in (None, ida_idaapi.BADADDR):
+        print("%08X: failed to decode call-site length" % ea2)
+        return None
       cs_lp,    ea4 = read_enc_val(ea3, cs_enc, True, text_ea = text_base, data_ea = data_base, funcrel_ea = lpstart)
+      if ea4 in (None, ida_idaapi.BADADDR):
+        print("%08X: failed to decode call-site landing pad" % ea3)
+        return None
       cs_action,ea5 = read_enc_val(ea4, DW_EH_PE_uleb128, True)
+      if ea5 in (None, ida_idaapi.BADADDR):
+        print("%08X: failed to decode call-site action index" % ea4)
+        return None
       if lpstart is not None:
         cs_start += lpstart
         if cs_lp != 0:
@@ -758,6 +797,9 @@ def format_lsda(ea, lpstart = None, sjlj = False):
       })
       act_ea = ea4
       ea = ea5
+    if ea in (None, ida_idaapi.BADADDR):
+      print("%08X: LSDA call-site parser reached invalid cursor" % lsda_start_ea)
+      return None
     if cs_action == 0:
       addcmt = "no action"
     else:
@@ -771,10 +813,19 @@ def format_lsda(ea, lpstart = None, sjlj = False):
     act = actions.pop()
     if not act in actions2:
       act_ea = action_tbl + act - 1
+      if lsda_limit not in (None, ida_idaapi.BADADDR) and (act_ea < lsda_start_ea or act_ea >= lsda_limit):
+        print("%08X: LSDA action entry out of bounds (act=%d ea=%08X seg_end=%08X)" % (lsda_start_ea, act, act_ea, lsda_limit))
+        return None
       # print("action %d -> %08X" % (act, act_ea))
       actions2.append(act)
       ar_filter,ea2 = read_enc_val(act_ea, DW_EH_PE_sleb128, True)
+      if ea2 in (None, ida_idaapi.BADADDR):
+        print("%08X: failed to decode LSDA action filter" % act_ea)
+        return None
       ar_disp,  ea3 = read_enc_val(ea2, DW_EH_PE_sleb128, True)
+      if ea3 in (None, ida_idaapi.BADADDR):
+        print("%08X: failed to decode LSDA action displacement" % ea2)
+        return None
       if ar_filter == 0:
         addcmt = "cleanup"
       else:
@@ -797,9 +848,15 @@ def format_lsda(ea, lpstart = None, sjlj = False):
         addcmt = "end"
       else:
         next_ea = ea2 + ar_disp
-        next_act = next_ea - act_ea + act
-        addcmt = "next: %d => %08X" % (next_act, next_ea)
-        actions.append(next_act)
+        if lsda_limit not in (None, ida_idaapi.BADADDR) and (next_ea < lsda_start_ea or next_ea >= lsda_limit):
+          addcmt = "next out of bounds"
+        else:
+          next_act = next_ea - act_ea + act
+          if next_act > 0:
+            addcmt = "next: %d => %08X" % (next_act, next_ea)
+            actions.append(next_act)
+          else:
+            addcmt = "invalid next action"
       set_cmt(ea2, "ar_disp[%d]: %d (%s)" % (act, ar_disp, addcmt), 0)
   _last_lsda_info = {
     "start_ea": lsda_start_ea,
@@ -842,7 +899,20 @@ def format_cie_fde(ea):
   else:
     sz = sz32
     make_reloff(start, ea)
+  if sz in (None, ida_idaapi.BADADDR) or sz <= 0:
+    _set_skip_diag(start, "bad_entry_size", "Invalid CFI entry size", size = sz)
+    return ida_idaapi.BADADDR, ida_idaapi.BADADDR, ida_idaapi.BADADDR
+  if sz > MAX_CFI_ENTRY_SIZE:
+    _set_skip_diag(start, "entry_too_large", "CFI entry size is suspiciously large", size = sz, limit = MAX_CFI_ENTRY_SIZE)
+    return ida_idaapi.BADADDR, ida_idaapi.BADADDR, ida_idaapi.BADADDR
   end_ea = ea + sz
+  if end_ea <= ea:
+    _set_skip_diag(start, "bad_entry_end", "CFI entry end overflow/underflow", size = sz, body_start = ea)
+    return ida_idaapi.BADADDR, ida_idaapi.BADADDR, ida_idaapi.BADADDR
+  seg = ida_segment.getseg(start)
+  if seg and end_ea > seg.end_ea:
+    _set_skip_diag(start, "entry_out_of_bounds", "CFI entry exceeds segment bounds", end_ea = end_ea, seg_end = seg.end_ea, size = sz)
+    return ida_idaapi.BADADDR, ida_idaapi.BADADDR, ida_idaapi.BADADDR
   if ext_mode:
     ForceQword(ea)
     cie_id = ida_bytes.get_qword(ea)
