@@ -1435,6 +1435,7 @@ class ps5_elf_plugin_t(ida_idaapi.plugin_t):
 		self._pre_analysis_done = False
 		self._post_analysis_done = False
 		self._post_analysis_running = False
+		self._func_bounds_fixup_active = False
 		self._jmprel_info_off = None
 		self._tls_templates = []
 
@@ -3338,9 +3339,10 @@ class ps5_elf_plugin_t(ida_idaapi.plugin_t):
 				print('Setting function 0x%x end to 0x%x from .eh_frame (old: 0x%x).' % (func.start_ea, want_end, func.end_ea))
 
 			try:
-				func.end_ea = want_end
-				ida_funcs.reanalyze_function(func, func.start_ea, want_end, False)
-				changed += 1
+				if ida_funcs.set_func_end(func.start_ea, want_end):
+					nf = ida_funcs.get_func(func.start_ea) or func
+					ida_funcs.reanalyze_function(nf, nf.start_ea, want_end, False)
+					changed += 1
 			except Exception:
 				pass
 
@@ -4937,34 +4939,40 @@ class ps5_elf_plugin_t(ida_idaapi.plugin_t):
 		return True
 
 	def fixup_func_bounds(self, func, max_func_end_ea):
-		end_ea = func.end_ea
-
-		# Respect IDA's suggested maximum.
-		if max_func_end_ea != ida_idaapi.BADADDR and end_ea >= max_func_end_ea:
+		if self._func_bounds_fixup_active:
 			return
+		self._func_bounds_fixup_active = True
+		try:
+			end_ea = func.end_ea
 
-		insn_len = len(ps5_elf_plugin_t.UD2_INSN_BYTES)
-		read_len = insn_len
-		if max_func_end_ea != ida_idaapi.BADADDR:
-			read_len = min(read_len, max_func_end_ea - end_ea)
-			if read_len < insn_len:
+			# Respect IDA's suggested maximum.
+			if max_func_end_ea != ida_idaapi.BADADDR and end_ea >= max_func_end_ea:
 				return
 
-		data = ida_bytes.get_bytes(end_ea, read_len)
-		if not data or data[:insn_len] != ps5_elf_plugin_t.UD2_INSN_BYTES:
-			return
+			insn_len = len(ps5_elf_plugin_t.UD2_INSN_BYTES)
+			read_len = insn_len
+			if max_func_end_ea != ida_idaapi.BADADDR:
+				read_len = min(read_len, max_func_end_ea - end_ea)
+				if read_len < insn_len:
+					return
 
-		new_end_ea = end_ea + insn_len
-		if max_func_end_ea != ida_idaapi.BADADDR:
-			new_end_ea = min(new_end_ea, max_func_end_ea)
+			data = ida_bytes.get_bytes(end_ea, read_len)
+			if not data or data[:insn_len] != ps5_elf_plugin_t.UD2_INSN_BYTES:
+				return
 
-		if new_end_ea == func.end_ea:
-			return
+			new_end_ea = end_ea + insn_len
+			if max_func_end_ea != ida_idaapi.BADADDR:
+				new_end_ea = min(new_end_ea, max_func_end_ea)
 
-		print('Setting function 0x%x end to 0x%x (old: 0x%x).' % (func.start_ea, new_end_ea, func.end_ea))
-		func.end_ea = new_end_ea
+			if new_end_ea == func.end_ea:
+				return
 
-		ida_funcs.reanalyze_function(func, func.start_ea, new_end_ea, False)
+			print('Setting function 0x%x end to 0x%x (old: 0x%x).' % (func.start_ea, new_end_ea, func.end_ea))
+			if ida_funcs.set_func_end(func.start_ea, new_end_ea):
+				nf = ida_funcs.get_func(func.start_ea) or func
+				ida_funcs.reanalyze_function(nf, nf.start_ea, new_end_ea, False)
+		finally:
+			self._func_bounds_fixup_active = False
 
 	def _fixup_symbols(self):
 		print('Fixing up symbols.')
